@@ -202,12 +202,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, cmd)
 
 		// Add prefetching for adjacent items if we're in the revisions view
+		// but only if we're not currently opening a file details view
 		if m.revisions != nil && !m.revisions.IsFocused() && m.oplog == nil {
-			// Get adjacent items for prefetching from revisions model
-			if adjacentItems := m.revisions.GetAdjacentItems(); len(adjacentItems) > 0 {
-				cmds = append(cmds, func() tea.Msg {
-					return preview.PrefetchMsg{Items: adjacentItems}
-				})
+			// Skip prefetching while opening file details to prevent slowdowns
+			isDetailOperation := false
+			if op := m.revisions.CurrentOperation(); op != nil {
+				isDetailOperation = op.Name() == "details"
+			}
+
+			// Only prefetch if we're not in details view (file list)
+			if !isDetailOperation {
+				// Get adjacent items for prefetching from revisions model
+				if adjacentItems := m.revisions.GetAdjacentItems(); len(adjacentItems) > 0 {
+					cmds = append(cmds, func() tea.Msg {
+						return preview.PrefetchMsg{Items: adjacentItems}
+					})
+				}
 			}
 		}
 	}

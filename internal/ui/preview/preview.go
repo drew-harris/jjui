@@ -193,17 +193,23 @@ func (m *Model) fetchContent(item context.SelectedItem) (string, CacheKey, error
 // prefetchItem loads an item in the background and caches it
 func (m *Model) prefetchItem(key CacheKey) tea.Cmd {
 	return func() tea.Msg {
+		keyCopy := key
 		// Use a sync.Map to track ongoing prefetches to avoid duplicates
-		_, loaded := m.prefetching.LoadOrStore(key, true)
+		_, loaded := m.prefetching.LoadOrStore(keyCopy, true)
 		if loaded {
 			// Already prefetching this item
 			return nil
 		}
 
-		defer m.prefetching.Delete(key)
+		defer m.prefetching.Delete(keyCopy)
 
 		item := m.context.SelectedItem()
-		if m.getCacheKey(item) != key {
+		// Safety check for nil
+		if item == nil {
+			return nil
+		}
+
+		if m.getCacheKey(item) != keyCopy {
 			// Selection changed while we were waiting, abort
 			return nil
 		}
@@ -226,7 +232,21 @@ type PrefetchMsg struct {
 // Prefetch preloads content for a list of items in the background
 func (m *Model) Prefetch(items []context.SelectedItem) tea.Cmd {
 	return func() tea.Msg {
+		// Limit number of prefetch operations to avoid overwhelming the system
+		const maxPrefetchItems = 2
+		prefetchCount := 0
+
 		for _, item := range items {
+			// Skip nil items
+			if item == nil {
+				continue
+			}
+
+			// Stop if we've hit our prefetch limit
+			if prefetchCount >= maxPrefetchItems {
+				break
+			}
+
 			key := m.getCacheKey(item)
 			if key == "" || key == m.currentKey {
 				continue
@@ -242,9 +262,24 @@ func (m *Model) Prefetch(items []context.SelectedItem) tea.Cmd {
 				continue
 			}
 
-			// Prefetch in background goroutine
-			go func(item context.SelectedItem, key CacheKey) {
+			// Increment prefetch count
+			prefetchCount++
+
+			// Use a copy of the values for the goroutine to avoid race conditions
+			itemCopy := item
+			keyCopy := key
+
+			// Prefetch in background goroutine with a small delay to avoid resource contention
+			go func(item context.SelectedItem, key CacheKey, index int) {
 				defer m.prefetching.Delete(key)
+
+				// Add a small delay based on index to stagger prefetch requests
+				time.Sleep(time.Duration(50*index) * time.Millisecond)
+
+				// Safe guard against nil
+				if item == nil {
+					return
+				}
 
 				content, fetchedKey, err := m.fetchContent(item)
 				if err != nil {
@@ -252,7 +287,7 @@ func (m *Model) Prefetch(items []context.SelectedItem) tea.Cmd {
 				}
 
 				m.cache.Set(fetchedKey, content)
-			}(item, key)
+			}(itemCopy, keyCopy, prefetchCount)
 		}
 
 		return nil

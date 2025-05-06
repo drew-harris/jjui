@@ -150,10 +150,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keyMap.Cancel), key.Matches(msg, m.keyMap.Details.Close):
 			return m, common.Close
 		case key.Matches(msg, m.keyMap.Details.Diff):
-			selected, ok := m.files.SelectedItem().(item)
+			selectedItem := m.files.SelectedItem()
+			if selectedItem == nil {
+				return m, nil
+			}
+
+			selected, ok := selectedItem.(item)
 			if !ok {
 				return m, nil
 			}
+
 			return m, func() tea.Msg {
 				output, _ := m.context.RunCommandImmediate(jj.Diff(m.revision, selected.fileName))
 				return common.ShowDiffMsg(output)
@@ -184,7 +190,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.confirmation = &model
 			return m, m.confirmation.Init()
 		case key.Matches(msg, m.keyMap.Details.ToggleSelect):
-			if item, ok := m.files.SelectedItem().(item); ok {
+			selectedItem := m.files.SelectedItem()
+			if selectedItem == nil {
+				return m, nil
+			}
+
+			if item, ok := selectedItem.(item); ok {
 				item.selected = !item.selected
 				oldIndex := m.files.Index()
 				m.files.CursorDown()
@@ -192,15 +203,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case key.Matches(msg, m.keyMap.Details.RevisionsChangingFile):
-			if item, ok := m.files.SelectedItem().(item); ok {
+			selectedItem := m.files.SelectedItem()
+			if selectedItem == nil {
+				return m, nil
+			}
+
+			if item, ok := selectedItem.(item); ok {
 				return m, tea.Batch(common.Close, revset.UpdateRevSet(fmt.Sprintf("files(%s)", item.fileName)))
 			}
 		default:
 			if len(m.files.Items()) > 0 {
 				var cmd tea.Cmd
 				m.files, cmd = m.files.Update(msg)
-				curItem := m.files.SelectedItem().(item)
-				return m, tea.Batch(cmd, m.context.SetSelectedItem(context.SelectedFile{ChangeId: m.revision, File: curItem.fileName}))
+				selectedItem := m.files.SelectedItem()
+				if selectedItem == nil {
+					return m, cmd
+				}
+
+				curItem, ok := selectedItem.(item)
+				if !ok {
+					return m, cmd
+				}
+
+				// Send a selection changed command directly
+				setSelectionCmd := m.context.SetSelectedItem(context.SelectedFile{ChangeId: m.revision, File: curItem.fileName})
+				return m, tea.Batch(cmd, setSelectionCmd)
 			}
 		}
 	case confirmation.CloseMsg:
@@ -213,7 +240,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		items := m.parseFiles(msg)
 		var selectionChangedCmd tea.Cmd
 		if len(items) > 0 {
-			selectionChangedCmd = m.context.SetSelectedItem(context.SelectedFile{ChangeId: m.revision, File: items[0].(item).fileName})
+			// Send a selection changed command directly
+			file := items[0].(item).fileName
+			selectionChangedCmd = m.context.SetSelectedItem(context.SelectedFile{ChangeId: m.revision, File: file})
 		}
 		return m, tea.Batch(selectionChangedCmd, m.files.SetItems(items))
 	case tea.WindowSizeMsg:
@@ -274,8 +303,15 @@ func (m Model) getSelectedFiles() ([]string, bool) {
 		}
 	}
 	if len(selectedFiles) == 0 {
-		selectedFiles = append(selectedFiles, m.files.SelectedItem().(item).fileName)
-		return selectedFiles, true
+		selectedItem := m.files.SelectedItem()
+		if selectedItem == nil {
+			return selectedFiles, false
+		}
+
+		if item, ok := selectedItem.(item); ok {
+			selectedFiles = append(selectedFiles, item.fileName)
+			return selectedFiles, true
+		}
 	}
 	return selectedFiles, isVirtuallySelected
 }
