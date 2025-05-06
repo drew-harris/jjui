@@ -423,18 +423,19 @@ func (m *Model) GetAdjacentItems() []context.SelectedItem {
 		return nil
 	}
 
-	items := make([]context.SelectedItem, 0, 2) // Preallocate for efficiency
+	items := make([]context.SelectedItem, 0, 4) // Preallocate for efficiency
 
-	// Only prefetch the next item for better responsiveness
-	// This makes it much less resource intensive when scrolling
-	nextIndex := m.cursor + 1
-	if nextIndex < len(m.rows) {
-		items = append(items, context.SelectedRevision{
-			ChangeId: m.rows[nextIndex].Commit.GetChangeId(),
-		})
+	// First priority: next 2 items
+	for i := 1; i <= 2; i++ {
+		nextIndex := m.cursor + i
+		if nextIndex < len(m.rows) {
+			items = append(items, context.SelectedRevision{
+				ChangeId: m.rows[nextIndex].Commit.GetChangeId(),
+			})
+		}
 	}
 
-	// If we have room, also prefetch the previous item
+	// Second priority: previous item
 	prevIndex := m.cursor - 1
 	if prevIndex >= 0 {
 		items = append(items, context.SelectedRevision{

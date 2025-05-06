@@ -93,11 +93,11 @@ type Model struct {
 
 const (
 	DebounceTime            = 200 * time.Millisecond
-	CacheTTL                = 5 * time.Minute // Time before cached items expire
-	PrefetchDelay           = 100 * time.Millisecond
-	PrefetchDebounce        = 300 * time.Millisecond
-	MaxConcurrentPrefetches = 2                      // Limit total concurrent prefetches
-	MinScrollInterval       = 150 * time.Millisecond // Minimum time between selection-triggered prefetches
+	CacheTTL                = 5 * time.Minute        // Time before cached items expire
+	PrefetchDelay           = 50 * time.Millisecond  // Reduced delay between prefetches
+	PrefetchDebounce        = 200 * time.Millisecond // Reduced debounce time
+	MaxConcurrentPrefetches = 3                      // Allow more concurrent prefetches
+	MinScrollInterval       = 100 * time.Millisecond // Reduced minimum time between prefetches
 )
 
 var border = lipgloss.NewStyle().Border(lipgloss.NormalBorder())
