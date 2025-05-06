@@ -92,13 +92,21 @@ type Model struct {
 }
 
 const (
-	DebounceTime     = 200 * time.Millisecond
-	CacheTTL         = 5 * time.Minute // Time before cached items expire
-	PrefetchDelay    = 100 * time.Millisecond
-	PrefetchDebounce = 300 * time.Millisecond
+	DebounceTime            = 200 * time.Millisecond
+	CacheTTL                = 5 * time.Minute // Time before cached items expire
+	PrefetchDelay           = 100 * time.Millisecond
+	PrefetchDebounce        = 300 * time.Millisecond
+	MaxConcurrentPrefetches = 2                      // Limit total concurrent prefetches
+	MinScrollInterval       = 150 * time.Millisecond // Minimum time between selection-triggered prefetches
 )
 
 var border = lipgloss.NewStyle().Border(lipgloss.NormalBorder())
+
+// Global prefetch semaphore to limit concurrent prefetch operations
+var prefetchSemaphore = make(chan struct{}, MaxConcurrentPrefetches)
+
+// Global timestamp to track the last selection change
+var lastSelectionChange = time.Now()
 
 type refreshPreviewContentMsg struct {
 	Tag int
@@ -194,6 +202,13 @@ func (m *Model) fetchContent(item context.SelectedItem) (string, CacheKey, error
 func (m *Model) prefetchItem(key CacheKey) tea.Cmd {
 	return func() tea.Msg {
 		keyCopy := key
+
+		// Skip if we're scrolling too quickly
+		now := time.Now()
+		if now.Sub(lastSelectionChange) < MinScrollInterval {
+			return nil
+		}
+
 		// Use a sync.Map to track ongoing prefetches to avoid duplicates
 		_, loaded := m.prefetching.LoadOrStore(keyCopy, true)
 		if loaded {
@@ -201,7 +216,21 @@ func (m *Model) prefetchItem(key CacheKey) tea.Cmd {
 			return nil
 		}
 
-		defer m.prefetching.Delete(keyCopy)
+		// Try to acquire a semaphore slot without blocking
+		select {
+		case prefetchSemaphore <- struct{}{}:
+			// Slot acquired, continue with prefetch
+		default:
+			// No slots available, skip prefetch
+			m.prefetching.Delete(keyCopy)
+			return nil
+		}
+
+		defer func() {
+			// Always release the semaphore when done
+			<-prefetchSemaphore
+			m.prefetching.Delete(keyCopy)
+		}()
 
 		item := m.context.SelectedItem()
 		// Safety check for nil
@@ -232,8 +261,19 @@ type PrefetchMsg struct {
 // Prefetch preloads content for a list of items in the background
 func (m *Model) Prefetch(items []context.SelectedItem) tea.Cmd {
 	return func() tea.Msg {
-		// Limit number of prefetch operations to avoid overwhelming the system
-		const maxPrefetchItems = 2
+		// If too many prefetching operations are already happening, just skip
+		if len(prefetchSemaphore) >= MaxConcurrentPrefetches {
+			return nil
+		}
+
+		// If we're scrolling too quickly, throttle prefetching
+		now := time.Now()
+		if now.Sub(lastSelectionChange) < MinScrollInterval {
+			return nil
+		}
+
+		// Limit number of prefetch operations per request
+		const maxPrefetchItems = 1
 		prefetchCount := 0
 
 		for _, item := range items {
@@ -269,12 +309,26 @@ func (m *Model) Prefetch(items []context.SelectedItem) tea.Cmd {
 			itemCopy := item
 			keyCopy := key
 
-			// Prefetch in background goroutine with a small delay to avoid resource contention
-			go func(item context.SelectedItem, key CacheKey, index int) {
-				defer m.prefetching.Delete(key)
+			// Try to acquire a semaphore slot without blocking
+			select {
+			case prefetchSemaphore <- struct{}{}:
+				// Slot acquired, continue with prefetch
+			default:
+				// No slots available, skip prefetch
+				m.prefetching.Delete(keyCopy)
+				continue
+			}
 
-				// Add a small delay based on index to stagger prefetch requests
-				time.Sleep(time.Duration(50*index) * time.Millisecond)
+			// Prefetch in background goroutine with a small delay to avoid resource contention
+			go func(item context.SelectedItem, key CacheKey) {
+				defer func() {
+					// Always release the semaphore and mark as no longer prefetching
+					<-prefetchSemaphore
+					m.prefetching.Delete(key)
+				}()
+
+				// Add a delay to stagger prefetch requests
+				time.Sleep(PrefetchDelay)
 
 				// Safe guard against nil
 				if item == nil {
@@ -287,7 +341,7 @@ func (m *Model) Prefetch(items []context.SelectedItem) tea.Cmd {
 				}
 
 				m.cache.Set(fetchedKey, content)
-			}(itemCopy, keyCopy, prefetchCount)
+			}(itemCopy, keyCopy)
 		}
 
 		return nil
@@ -315,6 +369,9 @@ func (m *Model) Update(msg tea.Msg) (*Model, tea.Cmd) {
 		return m, m.Prefetch(msg.Items)
 
 	case common.SelectionChangedMsg, common.RefreshMsg:
+		// Update the global timestamp to track selection changes
+		lastSelectionChange = time.Now()
+
 		m.tag++
 		tag := m.tag
 
