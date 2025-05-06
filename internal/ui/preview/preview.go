@@ -2,7 +2,9 @@ package preview
 
 import (
 	"bufio"
+	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/help"
@@ -20,6 +22,60 @@ type viewRange struct {
 	end   int
 }
 
+// CacheKey represents a unique key for the cache
+type CacheKey string
+
+// cacheEntry holds cached content along with its timestamp
+type cacheEntry struct {
+	content   string
+	timestamp time.Time
+}
+
+// ContentCache manages cached diff and preview content
+type ContentCache struct {
+	mu      sync.RWMutex
+	entries map[CacheKey]cacheEntry
+	ttl     time.Duration
+}
+
+// Get retrieves content for a key or returns false if not found/expired
+func (c *ContentCache) Get(key CacheKey) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, ok := c.entries[key]
+	if !ok {
+		return "", false
+	}
+
+	// Check if the entry is expired
+	if time.Since(entry.timestamp) > c.ttl {
+		return "", false
+	}
+
+	return entry.content, true
+}
+
+// Set stores content with the given key
+func (c *ContentCache) Set(key CacheKey, content string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.entries[key] = cacheEntry{
+		content:   content,
+		timestamp: time.Now(),
+	}
+}
+
+// NewCache creates a content cache with the given TTL
+func NewCache(ttl time.Duration) *ContentCache {
+	return &ContentCache{
+		entries: make(map[CacheKey]cacheEntry),
+		ttl:     ttl,
+	}
+}
+
+// Model represents the preview component
 type Model struct {
 	tag              int
 	viewRange        *viewRange
@@ -30,9 +86,17 @@ type Model struct {
 	contentLineCount int
 	context          context.AppContext
 	keyMap           config.KeyMappings[key.Binding]
+	cache            *ContentCache
+	prefetching      sync.Map
+	currentKey       CacheKey
 }
 
-const DebounceTime = 200 * time.Millisecond
+const (
+	DebounceTime     = 200 * time.Millisecond
+	CacheTTL         = 5 * time.Minute // Time before cached items expire
+	PrefetchDelay    = 100 * time.Millisecond
+	PrefetchDebounce = 300 * time.Millisecond
+)
 
 var border = lipgloss.NewStyle().Border(lipgloss.NormalBorder())
 
@@ -42,6 +106,11 @@ type refreshPreviewContentMsg struct {
 
 type updatePreviewContentMsg struct {
 	Content string
+	Key     CacheKey
+}
+
+type prefetchContentMsg struct {
+	Key CacheKey
 }
 
 func (m *Model) Width() int {
@@ -62,41 +131,211 @@ func (m *Model) SetHeight(h int) {
 }
 
 func (m *Model) Init() tea.Cmd {
-	return nil
+	// Initialize with the current selection if available
+	item := m.context.SelectedItem()
+	if item == nil {
+		return nil
+	}
+
+	key := m.getCacheKey(item)
+	m.currentKey = key
+
+	// Immediately load the first view
+	return func() tea.Msg {
+		content, key, err := m.fetchContent(item)
+		if err != nil {
+			return nil
+		}
+
+		m.cache.Set(key, content)
+		return updatePreviewContentMsg{Content: content, Key: key}
+	}
+}
+
+// getCacheKey creates a unique cache key for the currently selected item
+func (m *Model) getCacheKey(item context.SelectedItem) CacheKey {
+	switch v := item.(type) {
+	case context.SelectedFile:
+		return CacheKey(fmt.Sprintf("file:%s:%s", v.ChangeId, v.File))
+	case context.SelectedRevision:
+		return CacheKey(fmt.Sprintf("revision:%s", v.ChangeId))
+	case context.SelectedOperation:
+		return CacheKey(fmt.Sprintf("operation:%s", v.OperationId))
+	default:
+		return ""
+	}
+}
+
+// fetchContent loads content for given selected item
+func (m *Model) fetchContent(item context.SelectedItem) (string, CacheKey, error) {
+	var output []byte
+	var err error
+	key := m.getCacheKey(item)
+
+	switch v := item.(type) {
+	case context.SelectedFile:
+		output, err = m.context.RunCommandImmediate(jj.Diff(v.ChangeId, v.File, config.Current.Preview.ExtraArgs...))
+	case context.SelectedRevision:
+		output, err = m.context.RunCommandImmediate(jj.Show(v.ChangeId, config.Current.Preview.ExtraArgs...))
+	case context.SelectedOperation:
+		output, err = m.context.RunCommandImmediate(jj.OpShow(v.OperationId))
+	default:
+		return "", "", fmt.Errorf("unknown item type")
+	}
+
+	if err != nil {
+		return "", key, err
+	}
+
+	return string(output), key, nil
+}
+
+// prefetchItem loads an item in the background and caches it
+func (m *Model) prefetchItem(key CacheKey) tea.Cmd {
+	return func() tea.Msg {
+		// Use a sync.Map to track ongoing prefetches to avoid duplicates
+		_, loaded := m.prefetching.LoadOrStore(key, true)
+		if loaded {
+			// Already prefetching this item
+			return nil
+		}
+
+		defer m.prefetching.Delete(key)
+
+		item := m.context.SelectedItem()
+		if m.getCacheKey(item) != key {
+			// Selection changed while we were waiting, abort
+			return nil
+		}
+
+		content, fetchedKey, err := m.fetchContent(item)
+		if err != nil {
+			return nil // Silently fail prefetch
+		}
+
+		m.cache.Set(fetchedKey, content)
+		return updatePreviewContentMsg{Content: content, Key: fetchedKey}
+	}
+}
+
+// PrefetchMsg is a message used to request prefetching of additional items
+type PrefetchMsg struct {
+	Items []context.SelectedItem
+}
+
+// Prefetch preloads content for a list of items in the background
+func (m *Model) Prefetch(items []context.SelectedItem) tea.Cmd {
+	return func() tea.Msg {
+		for _, item := range items {
+			key := m.getCacheKey(item)
+			if key == "" || key == m.currentKey {
+				continue
+			}
+
+			// Skip if already cached
+			if _, found := m.cache.Get(key); found {
+				continue
+			}
+
+			// Skip if already prefetching
+			if _, loaded := m.prefetching.LoadOrStore(key, true); loaded {
+				continue
+			}
+
+			// Prefetch in background goroutine
+			go func(item context.SelectedItem, key CacheKey) {
+				defer m.prefetching.Delete(key)
+
+				content, fetchedKey, err := m.fetchContent(item)
+				if err != nil {
+					return
+				}
+
+				m.cache.Set(fetchedKey, content)
+			}(item, key)
+		}
+
+		return nil
+	}
 }
 
 func (m *Model) Update(msg tea.Msg) (*Model, tea.Cmd) {
+	var cmds []tea.Cmd
+
 	switch msg := msg.(type) {
 	case updatePreviewContentMsg:
-		m.content = msg.Content
-		m.contentLineCount = strings.Count(m.content, "\n")
-		m.reset()
+		// Only update display if this is for the current key or we have no content
+		if msg.Key == m.currentKey || m.content == "" {
+			m.content = msg.Content
+			m.contentLineCount = strings.Count(m.content, "\n")
+			m.reset()
+		}
+
+	case prefetchContentMsg:
+		// Schedule background prefetch
+		return m, m.prefetchItem(msg.Key)
+
+	case PrefetchMsg:
+		// Handle prefetching adjacent items
+		return m, m.Prefetch(msg.Items)
+
 	case common.SelectionChangedMsg, common.RefreshMsg:
 		m.tag++
 		tag := m.tag
-		return m, tea.Tick(DebounceTime, func(t time.Time) tea.Msg {
-			return refreshPreviewContentMsg{Tag: tag}
-		})
+
+		// Get the selected item
+		item := m.context.SelectedItem()
+		if item == nil {
+			return m, nil
+		}
+
+		// Create cache key for this selection
+		key := m.getCacheKey(item)
+		if key == "" {
+			return m, nil
+		}
+
+		m.currentKey = key
+
+		// Try to get from cache first
+		if cachedContent, found := m.cache.Get(key); found {
+			// Immediately update with cached content
+			m.content = cachedContent
+			m.contentLineCount = strings.Count(cachedContent, "\n")
+			m.reset()
+
+			// Still schedule a refresh in the background to ensure fresh content
+			cmds = append(cmds, tea.Tick(PrefetchDebounce, func(t time.Time) tea.Msg {
+				return prefetchContentMsg{Key: key}
+			}))
+		} else {
+			// No cache hit, schedule immediate fetch after debounce
+			cmds = append(cmds, tea.Tick(DebounceTime, func(t time.Time) tea.Msg {
+				return refreshPreviewContentMsg{Tag: tag}
+			}))
+		}
+
+		return m, tea.Batch(cmds...)
+
 	case refreshPreviewContentMsg:
 		if m.tag == msg.Tag {
-			switch msg := m.context.SelectedItem().(type) {
-			case context.SelectedFile:
-				return m, func() tea.Msg {
-					output, _ := m.context.RunCommandImmediate(jj.Diff(msg.ChangeId, msg.File, config.Current.Preview.ExtraArgs...))
-					return updatePreviewContentMsg{Content: string(output)}
+			item := m.context.SelectedItem()
+			if item == nil {
+				return m, nil
+			}
+
+			return m, func() tea.Msg {
+				content, key, err := m.fetchContent(item)
+				if err != nil {
+					return nil
 				}
-			case context.SelectedRevision:
-				return m, func() tea.Msg {
-					output, _ := m.context.RunCommandImmediate(jj.Show(msg.ChangeId, config.Current.Preview.ExtraArgs...))
-					return updatePreviewContentMsg{Content: string(output)}
-				}
-			case context.SelectedOperation:
-				return m, func() tea.Msg {
-					output, _ := m.context.RunCommandImmediate(jj.OpShow(msg.OperationId))
-					return updatePreviewContentMsg{Content: string(output)}
-				}
+
+				// Update cache
+				m.cache.Set(key, content)
+				return updatePreviewContentMsg{Content: content, Key: key}
 			}
 		}
+
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, m.keyMap.Preview.ScrollDown):
@@ -124,6 +363,7 @@ func (m *Model) Update(msg tea.Msg) (*Model, tea.Cmd) {
 			m.viewRange.end -= halfPageSize
 		}
 	}
+
 	return m, nil
 }
 
@@ -155,9 +395,11 @@ func (m *Model) reset() {
 func New(context context.AppContext) Model {
 	keyMap := context.KeyMap()
 	return Model{
-		viewRange: &viewRange{start: 0, end: 0},
-		context:   context,
-		keyMap:    keyMap,
-		help:      help.New(),
+		viewRange:   &viewRange{start: 0, end: 0},
+		context:     context,
+		keyMap:      keyMap,
+		help:        help.New(),
+		cache:       NewCache(CacheTTL),
+		prefetching: sync.Map{},
 	}
 }

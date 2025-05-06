@@ -197,8 +197,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.previewVisible {
+		// Get current selection for preview
 		m.previewModel, cmd = m.previewModel.Update(msg)
 		cmds = append(cmds, cmd)
+
+		// Add prefetching for adjacent items if we're in the revisions view
+		if m.revisions != nil && !m.revisions.IsFocused() && m.oplog == nil {
+			// Get adjacent items for prefetching from revisions model
+			if adjacentItems := m.revisions.GetAdjacentItems(); len(adjacentItems) > 0 {
+				cmds = append(cmds, func() tea.Msg {
+					return preview.PrefetchMsg{Items: adjacentItems}
+				})
+			}
+		}
 	}
 
 	return m, tea.Batch(cmds...)

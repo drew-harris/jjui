@@ -417,6 +417,29 @@ func (m *Model) GetCommitIds() []string {
 	return commitIds
 }
 
+// GetAdjacentItems returns the items adjacent to the current cursor for prefetching
+func (m *Model) GetAdjacentItems() []context.SelectedItem {
+	if len(m.rows) == 0 || m.cursor < 0 || m.cursor >= len(m.rows) {
+		return nil
+	}
+
+	items := make([]context.SelectedItem, 0, 4) // Preallocate for efficiency
+
+	// Add items above and below cursor for prefetching
+	for i := max(0, m.cursor-2); i < min(len(m.rows), m.cursor+3); i++ {
+		if i == m.cursor {
+			continue // Skip current item as it's already being displayed
+		}
+
+		// Add the revision for prefetching
+		items = append(items, context.SelectedRevision{
+			ChangeId: m.rows[i].Commit.GetChangeId(),
+		})
+	}
+
+	return items
+}
+
 func New(c context.AppContext, revset string) Model {
 	v := viewRange{start: 0, end: 0}
 	keymap := c.KeyMap()
