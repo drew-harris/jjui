@@ -3,6 +3,7 @@ package preview
 import (
 	"bufio"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/help"
@@ -30,6 +31,32 @@ type Model struct {
 	contentLineCount int
 	context          context.AppContext
 	keyMap           config.KeyMappings[key.Binding]
+	cache            *previewCache
+	msgCh            chan tea.Msg // message channel for prefetch updates
+}
+
+type previewCache struct {
+	mu      sync.RWMutex
+	content map[string]string
+}
+
+func newPreviewCache() *previewCache {
+	return &previewCache{
+		content: make(map[string]string),
+	}
+}
+
+func (c *previewCache) get(key string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	content, ok := c.content[key]
+	return content, ok
+}
+
+func (c *previewCache) set(key string, content string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.content[key] = content
 }
 
 const DebounceTime = 200 * time.Millisecond
@@ -42,6 +69,10 @@ type refreshPreviewContentMsg struct {
 
 type updatePreviewContentMsg struct {
 	Content string
+}
+
+type prefetchPreviewContentMsg struct {
+	Item context.SelectedItem
 }
 
 func (m *Model) Width() int {
@@ -65,34 +96,114 @@ func (m *Model) Init() tea.Cmd {
 	return nil
 }
 
+func (m *Model) getCacheKey(item context.SelectedItem) string {
+	switch v := item.(type) {
+	case context.SelectedFile:
+		return "file:" + v.ChangeId + ":" + v.File
+	case context.SelectedRevision:
+		return "revision:" + v.ChangeId
+	case context.SelectedOperation:
+		return "operation:" + v.OperationId
+	default:
+		return ""
+	}
+}
+
+func (m *Model) prefetchContent(item context.SelectedItem) tea.Cmd {
+	return func() tea.Msg {
+		var output []byte
+		var err error
+
+		switch v := item.(type) {
+		case context.SelectedRevision:
+			output, err = m.context.RunCommandImmediate(jj.Show(v.ChangeId))
+		case context.SelectedFile:
+			output, err = m.context.RunCommandImmediate(jj.Show(v.ChangeId, v.File))
+		case context.SelectedOperation:
+			output, err = m.context.RunCommandImmediate(jj.OpShow(v.OperationId))
+		}
+
+		if err != nil {
+			return nil
+		}
+
+		content := string(output)
+		m.cache.set(m.getCacheKey(item), content)
+		return nil
+	}
+}
+
 func (m *Model) Update(msg tea.Msg) (*Model, tea.Cmd) {
+	var cmd tea.Cmd
+
 	switch msg := msg.(type) {
 	case updatePreviewContentMsg:
 		m.content = msg.Content
 		m.contentLineCount = strings.Count(m.content, "\n")
 		m.reset()
 	case common.SelectionChangedMsg, common.RefreshMsg:
-		m.tag++
-		tag := m.tag
-		return m, tea.Tick(DebounceTime, func(t time.Time) tea.Msg {
-			return refreshPreviewContentMsg{Tag: tag}
-		})
-	case refreshPreviewContentMsg:
-		if m.tag == msg.Tag {
-			switch msg := m.context.SelectedItem().(type) {
-			case context.SelectedFile:
-				return m, func() tea.Msg {
-					output, _ := m.context.RunCommandImmediate(jj.Diff(msg.ChangeId, msg.File, config.Current.Preview.ExtraArgs...))
+		item := m.context.SelectedItem()
+		switch v := item.(type) {
+		case context.SelectedRevision:
+			if content, ok := m.cache.get(m.getCacheKey(v)); ok {
+				m.content = content
+				m.contentLineCount = strings.Count(content, "\n")
+				m.reset()
+			} else {
+				cmd = func() tea.Msg {
+					output, _ := m.context.RunCommandImmediate(jj.Show(v.ChangeId, config.Current.Preview.ExtraArgs...))
+					m.cache.set(m.getCacheKey(v), string(output))
 					return updatePreviewContentMsg{Content: string(output)}
 				}
-			case context.SelectedRevision:
+			}
+			// Aggressively prefetch next 10 revisions in parallel
+			if nextItems := m.context.GetNextItems(10); nextItems != nil {
+				for _, nitem := range nextItems {
+					if rev, isRev := nitem.(context.SelectedRevision); isRev {
+						go func(it context.SelectedRevision) {
+							output, _ := m.context.RunCommandImmediate(jj.Show(it.ChangeId, config.Current.Preview.ExtraArgs...))
+							m.cache.set(m.getCacheKey(it), string(output))
+							// If the user is now viewing this revision, update the preview immediately
+							if cur, ok := m.context.SelectedItem().(context.SelectedRevision); ok && cur.ChangeId == it.ChangeId {
+								select {
+								case m.msgCh <- updatePreviewContentMsg{Content: string(output)}:
+								default:
+								}
+							}
+						}(rev)
+					}
+				}
+			}
+			// Prefetch file-level diffs for the selected revision
+			go func(rev context.SelectedRevision) {
+				output, _ := m.context.RunCommandImmediate(jj.Show(rev.ChangeId, config.Current.Preview.ExtraArgs...))
+				files := extractFilesFromShowOutput(string(output))
+				for _, file := range files {
+					go func(f string) {
+						fileDiff, _ := m.context.RunCommandImmediate(jj.Diff(rev.ChangeId, f, config.Current.Preview.ExtraArgs...))
+						m.cache.set("file:"+rev.ChangeId+":"+f, string(fileDiff))
+					}(file)
+				}
+			}(v)
+			return m, cmd
+		case context.SelectedFile, context.SelectedOperation:
+			m.tag++
+			tag := m.tag
+			return m, tea.Tick(DebounceTime, func(t time.Time) tea.Msg {
+				return refreshPreviewContentMsg{Tag: tag}
+			})
+		}
+	case refreshPreviewContentMsg:
+		if m.tag == msg.Tag {
+			switch item := m.context.SelectedItem().(type) {
+			case context.SelectedFile:
 				return m, func() tea.Msg {
-					output, _ := m.context.RunCommandImmediate(jj.Show(msg.ChangeId, config.Current.Preview.ExtraArgs...))
+					output, _ := m.context.RunCommandImmediate(jj.Diff(item.ChangeId, item.File, config.Current.Preview.ExtraArgs...))
 					return updatePreviewContentMsg{Content: string(output)}
 				}
 			case context.SelectedOperation:
 				return m, func() tea.Msg {
-					output, _ := m.context.RunCommandImmediate(jj.OpShow(msg.OperationId))
+					output, _ := m.context.RunCommandImmediate(jj.OpShow(item.OperationId))
 					return updatePreviewContentMsg{Content: string(output)}
 				}
 			}
@@ -124,7 +235,34 @@ func (m *Model) Update(msg tea.Msg) (*Model, tea.Cmd) {
 			m.viewRange.end -= halfPageSize
 		}
 	}
-	return m, nil
+	return m, cmd
+}
+
+func (m *Model) fetchContent(item context.SelectedItem) tea.Cmd {
+	return func() tea.Msg {
+		var output []byte
+		var err error
+
+		switch v := item.(type) {
+		case context.SelectedRevision:
+			output, err = m.context.RunCommandImmediate(jj.Show(v.ChangeId))
+		case context.SelectedFile:
+			output, err = m.context.RunCommandImmediate(jj.Show(v.ChangeId, v.File))
+		case context.SelectedOperation:
+			output, err = m.context.RunCommandImmediate(jj.OpShow(v.OperationId))
+		}
+
+		if err != nil {
+			return common.CommandCompletedMsg{
+				Output: string(output),
+				Err:    err,
+			}
+		}
+
+		content := string(output)
+		m.cache.set(m.getCacheKey(item), content)
+		return updatePreviewContentMsg{Content: content}
+	}
 }
 
 func (m *Model) View() string {
@@ -154,10 +292,38 @@ func (m *Model) reset() {
 
 func New(context context.AppContext) Model {
 	keyMap := context.KeyMap()
-	return Model{
+	msgCh := make(chan tea.Msg, 32)
+	m := Model{
 		viewRange: &viewRange{start: 0, end: 0},
 		context:   context,
 		keyMap:    keyMap,
 		help:      help.New(),
+		cache:     newPreviewCache(),
+		msgCh:     msgCh,
 	}
+	// Start a goroutine to listen for prefetch update messages
+	go func() {
+		for msg := range msgCh {
+			_ = msg // discard for now
+		}
+	}()
+	return m
+}
+
+// extractFilesFromShowOutput parses the output of jj show and returns a list of files that appear in the diff.
+func extractFilesFromShowOutput(output string) []string {
+	var files []string
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "diff --git a/") {
+			// Example: diff --git a/foo.txt b/foo.txt
+			parts := strings.Split(line, " ")
+			if len(parts) >= 4 {
+				file := strings.TrimPrefix(parts[2], "a/")
+				files = append(files, file)
+			}
+		}
+	}
+	return files
 }

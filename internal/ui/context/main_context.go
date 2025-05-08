@@ -2,12 +2,14 @@ package context
 
 import (
 	"bytes"
+
+	"io"
+	"os/exec"
+
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/idursun/jjui/internal/config"
 	"github.com/idursun/jjui/internal/ui/common"
-	"io"
-	"os/exec"
 )
 
 type SelectedItem interface {
@@ -127,6 +129,12 @@ func (a *MainContext) RunInteractiveCommand(args []string, continuation tea.Cmd)
 			})()
 		}),
 	)
+}
+
+func (a *MainContext) GetNextItems(n int) []SelectedItem {
+	// For now, we'll just return nil since we don't have access to the revisions model
+	// This will be implemented by the revisions model itself
+	return nil
 }
 
 func NewAppContext(location string) AppContext {

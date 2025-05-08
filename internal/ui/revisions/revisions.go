@@ -521,6 +521,18 @@ func (m *Model) GetCommitIds() []string {
 	return commitIds
 }
 
+func (m *Model) GetNextItems(n int) []context.SelectedItem {
+	if m.rows == nil || m.cursor >= len(m.rows) {
+		return nil
+	}
+
+	var items []context.SelectedItem
+	for i := m.cursor + 1; i < min(m.cursor+1+n, len(m.rows)); i++ {
+		items = append(items, context.SelectedRevision{ChangeId: m.rows[i].Commit.GetChangeId()})
+	}
+	return items
+}
+
 func New(c context.AppContext, revset string) Model {
 	v := viewRange{start: 0, end: 0, lastRowIndex: -1}
 	keymap := c.KeyMap()
